@@ -1,0 +1,190 @@
+user = null;
+pipeline {
+    agent any
+    stages {
+        stage('Checkout') {
+            steps{
+                script {
+                    user = currentBuild.rawBuild.getCause(Cause.UserIdCause).getUserId()
+                    currentBuild.displayName = "#${BUILD_ID}: $user"
+                    dir('build') {
+                        deleteDir()
+                    }
+                    dir('build'){
+                        sh "touch .tempfile"
+                        sh "mkdir env_config"
+                    }
+
+                    requestParams=input message: 'Please select', ok: 'Proceed', parameters: [
+                        choice(choices: ['kgfs', 'kinara', 'irep-credit-capital', 'irep-dhan', 'northern-arc-capital', 'witfin', 'arohan', 'pahal', 'sambandh', 'saija', 'rssa', 'intellecash', 'maitreya', 'shramsarathi', 'sarvagram', 'new-demo', 'poc-demo2019', 'arohancs', 'arthan', 'visolent', 'safl' ], description: '', name: 'Client'),
+                        booleanParam(defaultValue: false, description: 'APK Required?', name: 'APK_REQUIRED'),
+                        choice( choices: ['debug','release'], description: 'APK Build Mode', name: 'BUILDMODE')
+                    ];
+
+                    env.CLIENT=requestParams["Client"]
+                    env.BUILDMODE = requestParams["BUILDMODE"];
+                    env.APK_REQUIRED = requestParams["APK_REQUIRED"]
+                    echo "$APK_REQUIRED"
+        
+                }
+            }
+        }
+        
+        stage ('Prepare'){
+                    steps{
+                dir("environments/${CLIENT}"){
+                    script {
+                        sh "ls -ail"
+                        def environments=sh(script:'for i in $(ls -d */); do echo ${i%%/}; done', returnStdout: true)
+                        env.RELEASE_ENVIRONMENT=input message:'Choose the target env', ok: 'Release!',
+                        parameters:[choice(name:'Environment', choices: environments)]
+                    }
+                }
+                dir("environments/${CLIENT}/${RELEASE_ENVIRONMENT}") {
+                    script {
+                        siteProps = readProperties file: 'build.properties'
+                        deployProps = readProperties file: 'deploy.properties'
+                        serverExtEnvProps = readProperties file: 'configurations/server-ext__env.env'
+                        sh "cp -R ./configurations/* ../../../build/env_config"
+                        currentBuild.displayName = "#${BUILD_ID}: ${CLIENT}/${RELEASE_ENVIRONMENT}/${siteProps.GIT_BRANCH} -$user"
+                        if ( "$APK_REQUIRED" == "true" ){
+                        def props = readJSON file: 'version.json'
+                        env.VERSION = props.CurrentBuildVersion
+                        env.DEPLOY_PATH_DIR = siteProps.ENV_URL_NAME
+                        env.APP_NAME_POST=siteProps.APP_NAME_POSTFIX
+                        env.MAILING_LIST=siteProps.MAILING_LIST
+                        }
+                    }
+                }
+
+                
+                dir('code'){
+                    git branch:siteProps.GIT_BRANCH, changelog: false, credentialsId: 'gitea-build', poll: false, url: 'https://vcs.perdix.co:3000/perdix/irf-perdix-client'
+                }
+                dir("code/target"){
+                    deleteDir()
+                    script {
+                        sh "echo ${BUILD_NUMBER} > .build"
+                    }
+                }
+                dir("common") {
+                    script {
+                        sh "cp deploy.sh ../code/target/"
+                    }
+                }
+            }
+        }
+
+
+        
+        stage ('Build') {
+            steps {
+                dir("code") {
+                    script {
+                        // START OF VALIDATION
+                        echo "Validating build.properties..."
+                        if (!siteProps.SITECODE || siteProps.SITECODE==''){
+                            throw new hudson.AbortException("Couldn't find Site Code in Properties file.")
+                        }
+
+                        echo "Validation completed!"
+
+                        // Setting necessary variables on env
+                        env.APP_NAME = env.RELEASE_ENVIRONMENT.toUpperCase() + " - " +env.APP_NAME_POST
+                        if (env.CORDOVA_ANDROID_VERSION?.trim()) {
+                            env.CDV_AND_VERSION = env.CORDOVA_ANDROID_VERSION
+                        }
+                        env.CDV_AND_VERSION = "6.4.0"
+                        env.APK_FILE_NAME = "perdix-apk-b" + env.BUILD_NUMBER + "-" + env.BUILDMODE + "-" + env.VERSION + "-" + env.CLIENT + "-" + env.RELEASE_ENVIRONMENT + ".apk"
+                        env.APK_RELEASE_URL = env.DEPLOY_PATH_DIR + env.APK_FILE_NAME;
+
+                        // Setting siteproperties on environment
+                        siteProps.each{ k,v -> env[k] = v}
+                        env.SERVEREXT_DBNAME = serverExtEnvProps.DB_NAME
+                        sh "sh -xe ../common/build.sh"
+                    }
+                }
+            }
+        }
+
+        stage ('Package') {
+            steps {
+                dir ("code/target") {
+                    script {
+                        // GENERATE THE ZIP FILE WITH ALL DEPLOY PROPERTIES
+                        deployEnvContents = '#!/bin/bash \n'
+                        deployProps.each {k,v -> 
+                            if (k.contains("ENV_")){
+                                deployEnvContents <<= k.replace("ENV_", "") + '="' + v + '"\n'
+                            }
+                        }
+                        writeFile file: 'setenv.sh', text: deployEnvContents.toString();
+                    }
+                }
+            }
+        }
+
+        stage ('Deploy') {
+            steps {
+                dir("code") 
+                {
+                    script {
+                        def files = findFiles glob: '**/*.apk'
+                        boolean exists = files.length > 0
+                        if (!exists) {
+                            throw new hudson.AbortException("Target APK file not found.")
+                        }
+                        remoteDirectory = env.CLIENT + "/" + env.RELEASE_ENVIRONMENT + "/irf-perdix-apk/" + env.BUILD_NUMBER
+                        sshDestPath =  deployProps.SSH_PUBLISH_PATH + remoteDirectory
+                        sshPublisher(publishers: [sshPublisherDesc(configName: deployProps.SSH_SERVER_CODE, transfers: [sshTransfer(cleanRemote: false, excludes: '', execCommand: 'cd ' + sshDestPath + '\n chmod u+x deploy.sh \n ./deploy.sh', execTimeout: 120000, flatten: false, makeEmptyDirs: false, noDefaultExcludes: false, patternSeparator: '[, ]+', remoteDirectory: remoteDirectory, remoteDirectorySDF: false, removePrefix: 'target', sourceFiles: 'target/**/*')], usePromotionTimestamp: false, useWorkspaceInPromotion: false, verbose: false)])
+                    }
+                dir("../environments/${CLIENT}/${RELEASE_ENVIRONMENT}")
+                {
+                    script {
+                                if ( "$APK_REQUIRED" == "true" ){
+                                echo "${version}"
+                                def props1 = readJSON file: 'version.json'
+                                props1.LastBuildVersion = props1.CurrentBuildVersion
+                                v = props1.CurrentBuildVersion
+                                a=v.substring(0,1)
+                                b=v.substring(2,3)
+                                c=v.substring(4) as Integer
+                                c=c+1
+                                v1=a+'.'+b+'.'+c
+                                props1.CurrentBuildVersion = v1
+                                writeJSON file: 'version.json' , json: props1,pretty: 2
+                                sh "git config user.email 'build@dvara.com'"
+                                sh "git config user.name 'Dvara Build'"
+                                sh "git add version.json"
+                                sh "git commit -m 'message'"
+                                sh "git push origin HEAD:master -f"
+                                }
+
+            
+                            }
+                    }
+                    
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+			script{
+               if ( "$APK_REQUIRED" == "true" ) {
+                echo "Apk and client build"
+                echo "APK URL"
+                echo "${env.APK_RELEASE_URL}"
+                emailext body: 'APK is available at ' + env.APK_RELEASE_URL , to:env.MAILING_LIST , subject: 'Perdix APK Mailer - ' + env.CLIENT + ' - ' + env.RELEASE_ENVIRONMENT + ' - #' + env.BUILD_NUMBER
+               }
+               else {
+               echo "Only client build"
+               }
+               
+			}
+            
+        }
+    }
+
+}
